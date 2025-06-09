@@ -1,0 +1,2551 @@
+
+//+------------------------------------------------------------------+
+//|                                    TateStrategy_Fixed.mq5        |
+//|                          Copyright 2025, Tate Strategy Team      |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Tate Strategy Team"
+#property version   "3.01"
+#property description "Tate Strategy EA - Fixed Version"
+
+// Input Parameters
+input group "=== Risk Management ==="
+input double   RiskPerTrade = 1.0;           
+input double   MaxDailyLoss = 4.0;           
+input double   MaxDrawdown = 15.0;           
+input int      MaxDailyTrades = 10;          
+
+input group "=== Strategy Parameters ==="
+input int      MinGapPips = 4;               
+input double   TolerancePips = 1.5;          
+input int      MinMovePips = 10;             
+input double   MinRiskReward = 1.5;          
+input int      RetestTimeoutBars = 30;       // 10'dan 30'a çıkarıldı
+input int      LiquidityBuffer = 3;          
+
+input group "=== Time Filters ==="
+input int      LondonStartHour = 9;          
+input int      LondonEndHour = 12;           
+input int      NewYorkStartHour = 13;        
+input int      NewYorkEndHour = 16;          
+input bool     EnableAsiaSession = false;    
+
+input group "=== General Settings ==="
+input int      MagicNumber = 123456;         
+input bool     EnableAlerts = true;          
+input bool     EnableLogging = true;         
+input bool     DrawZones = true;             
+input int      GMTOffset = 0;                
+
+// Global Variables
+double         InitialBalance;
+double         DailyPnL = 0.0;
+int            DailyTradeCount = 0;
+datetime       LastTradeDate;
+string         CurrentBias = "NEUTRAL";
+int            TotalTrades = 0;
+int            WinningTrades = 0;
+
+// Structures
+struct HTFMitigationZone
+{
+   double high;
+   double low;
+   datetime time_formed;
+   bool is_bullish;
+   int strength;
+   bool still_valid;
+};
+
+struct LTFMitigationZone
+{
+   double high;
+   double low;
+   datetime time_formed;
+   bool is_bullish;
+   int parent_htf_index;
+   bool colored_candle_signal;
+};
+
+struct ACSDPattern
+{
+   datetime time_formed;
+   double break_price;
+   int direction;
+   bool has_protected_level;
+   double protected_level;
+   bool in_retest_phase;
+   datetime retest_deadline;
+   int confidence;
+};
+
+struct FVGZone
+{
+   double high;
+   double low;
+   datetime time_formed;
+   bool is_bullish;
+   bool filled;
+   bool strength_tested;
+   bool can_be_target;
+   double test_price;
+};
+
+struct EqualLevel
+{
+   double price;
+   int touch_count;
+   datetime last_touch;
+   bool cleared;
+   bool is_liquidity_pool;
+};
+
+struct SwingPoint
+{
+   double price;
+   datetime time;
+   bool is_high;
+   int strength;
+   bool swing_protected;
+};
+
+struct TateTradeSignal
+{
+   double entry_price;
+   double stop_loss;
+   double take_profit;
+   double risk_reward;
+   int direction;
+   datetime signal_time;
+   int confidence;
+   string formation_type;
+   bool is_retest_entry;
+};
+
+// Arrays
+HTFMitigationZone HTFMitigations[];
+LTFMitigationZone LTFMitigations[];
+ACSDPattern       ACSDFormations[];
+FVGZone          FVGZones[];
+EqualLevel       EqualLevels[];
+SwingPoint       SwingPoints[];
+
+// State Variables
+bool HTFAnalysisComplete = false;
+bool LTFAnalysisComplete = false;
+bool RetestPhaseActive = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Tate Strategy EA v3.01 Starting...");
+   
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+   {
+      Alert("Trade not allowed! Please enable AutoTrading!");
+      return(INIT_FAILED);
+   }
+   
+   // Check if trading is allowed for this symbol
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
+   {
+      Alert("Trading not allowed for this symbol!");
+      return(INIT_FAILED);
+   }
+   
+   InitialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   LastTradeDate = TimeCurrent();
+   
+   ArrayResize(HTFMitigations, 0);
+   ArrayResize(LTFMitigations, 0);
+   ArrayResize(ACSDFormations, 0);
+   ArrayResize(FVGZones, 0);
+   ArrayResize(EqualLevels, 0);
+   ArrayResize(SwingPoints, 0);
+   
+   ResetDailyCounters();
+   EventSetTimer(60);
+   
+   // Perform initial analysis
+   AnalyzeHTFBias();
+   FindHTFMitigationZones();
+   HTFAnalysisComplete = true;
+   
+   Print("Tate Strategy EA Started Successfully");
+   Print("Initial Balance: ", InitialBalance);
+   Print("Current Bias: ", CurrentBias);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   
+   if(DrawZones)
+   {
+      CleanupChartObjects();
+   }
+   
+   Print("Tate Strategy EA Stopped");
+   Print("Total Trades: ", TotalTrades);
+   Print("Winning Trades: ", WinningTrades);
+   
+   if(TotalTrades > 0)
+   {
+      double win_rate = (double)WinningTrades/TotalTrades*100;
+      Print("Win Rate: ", DoubleToString(win_rate, 1), "%");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Basic checks
+   if(!CheckRiskLimits()) 
+   {
+      LogDebug("Risk limits exceeded");
+      return;
+   }
+   
+   // Session kontrolünü devre dışı bırak test için
+   /*
+   if(!IsMarketSessionActive()) 
+   {
+      LogDebug("Outside trading session");
+      return;
+   }
+   */
+   
+   if(DailyTradeCount >= MaxDailyTrades) 
+   {
+      LogDebug("Daily trade limit reached");
+      return;
+   }
+   
+   // Check if we have open positions
+   if(HasOpenPosition())
+   {
+      LogDebug("Position already open");
+      return;
+   }
+   
+   // Perform main analysis
+   PerformTateAnalysisSequence();
+   
+   // BASIT TEST İŞLEMİ - Her 500 tick'te bir test işlemi aç
+   static int test_counter = 0;
+   test_counter++;
+   
+   if(test_counter % 500 == 0 && !HasOpenPosition())
+   {
+      // Basit bir test işlemi oluştur
+      TateTradeSignal test_signal;
+      test_signal.entry_price = (test_counter % 1000 == 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      test_signal.direction = (test_counter % 1000 == 0) ? 1 : -1;
+      
+      // Basit SL ve TP
+      if(test_signal.direction == 1) // Buy
+      {
+         test_signal.stop_loss = test_signal.entry_price - (50 * _Point * 10);
+         test_signal.take_profit = test_signal.entry_price + (100 * _Point * 10);
+      }
+      else // Sell
+      {
+         test_signal.stop_loss = test_signal.entry_price + (50 * _Point * 10);
+         test_signal.take_profit = test_signal.entry_price - (100 * _Point * 10);
+      }
+      
+      test_signal.risk_reward = 2.0;
+      test_signal.signal_time = TimeCurrent();
+      test_signal.confidence = 3;
+      test_signal.formation_type = "TEST_SIGNAL";
+      test_signal.is_retest_entry = false;
+      
+      LogInfo("TEST SIGNAL: Attempting to open test trade");
+      ExecuteTradeSignal(test_signal);
+   }
+   
+   // Debug: Her 100 tick'te bir durum bilgisi ver
+   if(test_counter % 100 == 0)
+   {
+      LogDebug(StringFormat("Tick %d: Bias=%s, HTF=%d, LTF=%d, ACSD=%d", 
+                           test_counter, CurrentBias, 
+                           ArraySize(HTFMitigations), 
+                           ArraySize(LTFMitigations),
+                           ArraySize(ACSDFormations)));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if we have open position                                  |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Timer function                                                   |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   datetime current_time = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(current_time, dt);
+   
+   // Update HTF analysis every hour
+   if(dt.min == 0)
+   {
+      AnalyzeHTFBias();
+      FindHTFMitigationZones();
+      HTFAnalysisComplete = true;
+      LogInfo("HTF analysis updated - Bias: " + CurrentBias);
+   }
+   
+   // Update LTF analysis every 15 minutes
+   if(dt.min % 15 == 0)
+   {
+      FindLTFMitigationZones();
+      UpdateSwingPoints();
+      LTFAnalysisComplete = true;
+   }
+   
+   // Update other analyses every 5 minutes
+   if(dt.min % 5 == 0)
+   {
+      DetectFVGZones();
+      UpdateEqualLevels();
+   }
+   
+   // Reset daily counters at midnight
+   if(dt.hour == 0 && dt.min == 0)
+   {
+      ResetDailyCounters();
+   }
+   
+   // Update chart display
+   if(DrawZones && dt.min % 5 == 0)
+   {
+      UpdateChartDisplay();
+   }
+   
+   // Monitor positions and check timeouts
+   MonitorOpenPositions();
+   CheckACSDTimeouts();
+   CheckEmergencyStop();
+}
+
+//+------------------------------------------------------------------+
+//| Main Tate Analysis Sequence                                     |
+//+------------------------------------------------------------------+
+void PerformTateAnalysisSequence()
+{
+   // Bias kontrolünü kaldırıyoruz test için
+   /*
+   if(CurrentBias == "NEUTRAL")
+   {
+      LogDebug("HTF Bias NEUTRAL - analysis stopped");
+      return;
+   }
+   */
+   
+   // Check if we have HTF zones
+   if(ArraySize(HTFMitigations) == 0)
+   {
+      LogDebug("No HTF mitigation zones");
+      return;
+   }
+   
+   // Ensure HTF analysis is complete
+   if(!HTFAnalysisComplete)
+   {
+      LogDebug("HTF analysis not complete");
+      return;
+   }
+   
+   // Analyze LTF structures
+   AnalyzeLTFMicroStructures();
+   
+   // Search for ACSD formations
+   SearchForACSDFormations();
+   
+   // Check for retests if active
+   if(RetestPhaseActive)
+   {
+      CheckActiveRetests();
+   }
+   
+   // Update market conditions
+   CheckNewHighLowBreaks();
+   CheckEqualLevelsClearing();
+   TestFVGStrengthWeakness();
+   
+   // Generate trade signal if conditions are met
+   GenerateTradeSignalIfReady();
+}
+
+//+------------------------------------------------------------------+
+//| HTF Bias Analysis - FIXED                                       |
+//+------------------------------------------------------------------+
+void AnalyzeHTFBias()
+{
+   double high4h[], low4h[], close4h[], open4h[];
+   double high1h[], low1h[], close1h[], open1h[];
+   
+   int copied4h = CopyHigh(_Symbol, PERIOD_H4, 0, 50, high4h);
+   int copied1h = CopyHigh(_Symbol, PERIOD_H1, 0, 100, high1h);
+   
+   if(copied4h < 20 || copied1h < 50) 
+   {
+      LogError("Insufficient data for HTF analysis");
+      return;
+   }
+   
+   CopyLow(_Symbol, PERIOD_H4, 0, 50, low4h);
+   CopyClose(_Symbol, PERIOD_H4, 0, 50, close4h);
+   CopyOpen(_Symbol, PERIOD_H4, 0, 50, open4h);
+   CopyLow(_Symbol, PERIOD_H1, 0, 100, low1h);
+   CopyClose(_Symbol, PERIOD_H1, 0, 100, close1h);
+   CopyOpen(_Symbol, PERIOD_H1, 0, 100, open1h);
+   
+   string structure_4h = AnalyzeMarketStructure(high4h, low4h, close4h, copied4h);
+   string structure_1h = AnalyzeMarketStructure(high1h, low1h, close1h, copied1h);
+   
+   // More aggressive bias determination
+   if(structure_4h == "DOWNTREND" || structure_1h == "DOWNTREND")
+   {
+      CurrentBias = "BEARISH";
+   }
+   else if(structure_4h == "UPTREND" || structure_1h == "UPTREND")
+   {
+      CurrentBias = "BULLISH";
+   }
+   else
+   {
+      // Use simple price comparison if no clear trend
+      double recent_close_4h = close4h[copied4h - 1];
+      double previous_close_4h = close4h[copied4h - 10];
+      
+      if(recent_close_4h > previous_close_4h)
+         CurrentBias = "BULLISH";
+      else if(recent_close_4h < previous_close_4h)
+         CurrentBias = "BEARISH";
+      else
+         CurrentBias = "NEUTRAL";
+   }
+   
+   LogInfo(StringFormat("HTF Bias updated: %s (4H: %s, 1H: %s)", CurrentBias, structure_4h, structure_1h));
+}
+
+//+------------------------------------------------------------------+
+//| Market Structure Analysis - IMPROVED                            |
+//+------------------------------------------------------------------+
+string AnalyzeMarketStructure(double &high[], double &low[], double &close[], int size)
+{
+   if(size < 10) return "UNKNOWN";
+   
+   int higher_highs = 0;
+   int lower_lows = 0;
+   int lower_highs = 0;
+   int higher_lows = 0;
+   
+   double min_move = MinMovePips * _Point * 10;
+   
+   // Analyze last 15 bars
+   for(int i = size - 15; i < size - 1; i++)
+   {
+      if(i <= 0) continue;
+      
+      // Count structure breaks
+      if(high[i] > high[i-1] + min_move)
+         higher_highs++;
+      else if(high[i] < high[i-1] - min_move)
+         lower_highs++;
+      
+      if(low[i] > low[i-1] + min_move)
+         higher_lows++;
+      else if(low[i] < low[i-1] - min_move)
+         lower_lows++;
+   }
+   
+   // More lenient trend determination
+   if(lower_lows >= 1 && lower_highs >= 1)
+      return "DOWNTREND";
+   
+   if(higher_highs >= 1 && higher_lows >= 1)
+      return "UPTREND";
+   
+   // Additional check using moving averages
+   double sum_recent = 0;
+   double sum_older = 0;
+   
+   for(int i = size - 5; i < size; i++)
+      sum_recent += close[i];
+   
+   for(int i = size - 15; i < size - 10; i++)
+      sum_older += close[i];
+   
+   double avg_recent = sum_recent / 5;
+   double avg_older = sum_older / 5;
+   
+   if(avg_recent > avg_older + min_move)
+      return "UPTREND";
+   else if(avg_recent < avg_older - min_move)
+      return "DOWNTREND";
+   
+   return "SIDEWAYS";
+}
+
+//+------------------------------------------------------------------+
+//| Find HTF Mitigation Zones - IMPROVED                           |
+//+------------------------------------------------------------------+
+void FindHTFMitigationZones()
+{
+   ArrayResize(HTFMitigations, 0);
+   
+   double high[], low[], open[], close[];
+   datetime time[];
+   
+   int copied = CopyHigh(_Symbol, PERIOD_H4, 0, 100, high);
+   if(copied < 30) 
+   {
+      LogError("Insufficient H4 data");
+      return;
+   }
+   
+   CopyLow(_Symbol, PERIOD_H4, 0, 100, low);
+   CopyOpen(_Symbol, PERIOD_H4, 0, 100, open);
+   CopyClose(_Symbol, PERIOD_H4, 0, 100, close);
+   CopyTime(_Symbol, PERIOD_H4, 0, 100, time);
+   
+   double min_reaction = MinMovePips * _Point * 10;
+   double tolerance = 3 * _Point * 10;
+   
+   // Look for mitigation zones
+   for(int i = 15; i < copied - 10; i++)
+   {
+      // Check if zone had previous visits
+      bool had_previous_visit = false;
+      int visit_count = 0;
+      
+      for(int j = i - 15; j < i; j++)
+      {
+         if(j < 0) continue;
+         
+         if(low[j] <= high[i] + tolerance && high[j] >= low[i] - tolerance)
+         {
+            visit_count++;
+            if(visit_count >= 2)
+            {
+               had_previous_visit = true;
+               break;
+            }
+         }
+      }
+      
+      if(!had_previous_visit) continue;
+      
+      // Check for strong reaction
+      double max_reaction = 0;
+      bool strong_reaction = false;
+      bool created_new_extreme = false;
+      
+      for(int k = i + 1; k <= i + 10 && k < copied; k++)
+      {
+         double reaction_up = high[k] - low[i];
+         double reaction_down = high[i] - low[k];
+         double current_reaction = MathMax(reaction_up, reaction_down);
+         
+         max_reaction = MathMax(max_reaction, current_reaction);
+         
+         if(max_reaction >= min_reaction)
+         {
+            strong_reaction = true;
+         }
+         
+         // Check if new extreme was created
+         if(close[i] > open[i]) // Bullish candle
+         {
+            if(high[k] > high[i] + min_reaction/2)
+               created_new_extreme = true;
+         }
+         else // Bearish candle
+         {
+            if(low[k] < low[i] - min_reaction/2)
+               created_new_extreme = true;
+         }
+      }
+      
+      // If all conditions met, add zone
+      if(strong_reaction && created_new_extreme)
+      {
+         // Check if not too close to existing zone
+         bool too_close_to_existing = false;
+         for(int z = 0; z < ArraySize(HTFMitigations); z++)
+         {
+            double zone_center = (HTFMitigations[z].high + HTFMitigations[z].low) / 2;
+            double current_center = (high[i] + low[i]) / 2;
+            
+            if(MathAbs(zone_center - current_center) < min_reaction/2)
+            {
+               too_close_to_existing = true;
+               break;
+            }
+         }
+         
+         if(!too_close_to_existing)
+         {
+            int size = ArraySize(HTFMitigations);
+            ArrayResize(HTFMitigations, size + 1);
+            
+            HTFMitigations[size].high = high[i];
+            HTFMitigations[size].low = low[i];
+            HTFMitigations[size].time_formed = time[i];
+            HTFMitigations[size].is_bullish = (close[i] > open[i]);
+            HTFMitigations[size].strength = (int)MathMin(5, max_reaction / min_reaction);
+            HTFMitigations[size].still_valid = true;
+            
+            LogInfo(StringFormat("HTF Zone added: %.5f - %.5f (%s)", 
+                               HTFMitigations[size].low, 
+                               HTFMitigations[size].high,
+                               HTFMitigations[size].is_bullish ? "Bullish" : "Bearish"));
+         }
+      }
+   }
+   
+   LogInfo(StringFormat("%d HTF mitigation zones detected", ArraySize(HTFMitigations)));
+}
+
+//+------------------------------------------------------------------+
+//| Analyze LTF Micro Structures                                    |
+//+------------------------------------------------------------------+
+void AnalyzeLTFMicroStructures()
+{
+   if(!HTFAnalysisComplete || ArraySize(HTFMitigations) == 0) 
+   {
+      LogDebug("HTF analysis not ready for LTF");
+      return;
+   }
+   
+   FindLTFMitigationZones();
+   LTFAnalysisComplete = true;
+}
+
+//+------------------------------------------------------------------+
+//| Find LTF Mitigation Zones - IMPROVED                           |
+//+------------------------------------------------------------------+
+void FindLTFMitigationZones()
+{
+   ArrayResize(LTFMitigations, 0);
+   
+   double high5[], low5[], open5[], close5[];
+   datetime time5[];
+   
+   int copied5 = CopyHigh(_Symbol, PERIOD_M5, 0, 200, high5);
+   if(copied5 < 50) 
+   {
+      LogError("Insufficient M5 data");
+      return;
+   }
+   
+   CopyLow(_Symbol, PERIOD_M5, 0, 200, low5);
+   CopyOpen(_Symbol, PERIOD_M5, 0, 200, open5);
+   CopyClose(_Symbol, PERIOD_M5, 0, 200, close5);
+   CopyTime(_Symbol, PERIOD_M5, 0, 200, time5);
+   
+   // Look for LTF zones within HTF zones
+   for(int htf_idx = 0; htf_idx < ArraySize(HTFMitigations); htf_idx++)
+   {
+      if(!HTFMitigations[htf_idx].still_valid) continue;
+      
+      for(int i = 10; i < copied5 - 5; i++)
+      {
+         // Check if candle is within HTF zone
+         if(low5[i] > HTFMitigations[htf_idx].high || high5[i] < HTFMitigations[htf_idx].low)
+            continue;
+         
+         // Check for colored candle (strong body)
+         double body_size = MathAbs(close5[i] - open5[i]);
+         double candle_range = high5[i] - low5[i];
+         
+         if(body_size < candle_range * 0.6) continue;
+         
+         // Check for recent move away from zone
+         bool recent_move = false;
+         for(int j = i + 1; j <= i + 3 && j < copied5; j++)
+         {
+            if(close5[i] > open5[i]) // Bullish
+            {
+               if(low5[j] < close5[i])
+                  recent_move = true;
+            }
+            else // Bearish
+            {
+               if(high5[j] > close5[i])
+                  recent_move = true;
+            }
+         }
+         
+         if(recent_move)
+         {
+            // Add LTF zone
+            int size = ArraySize(LTFMitigations);
+            ArrayResize(LTFMitigations, size + 1);
+            
+            LTFMitigations[size].high = high5[i];
+            LTFMitigations[size].low = low5[i];
+            LTFMitigations[size].time_formed = time5[i];
+            LTFMitigations[size].is_bullish = (close5[i] > open5[i]);
+            LTFMitigations[size].parent_htf_index = htf_idx;
+            LTFMitigations[size].colored_candle_signal = true;
+            
+            LogDebug(StringFormat("LTF Zone added: %.5f - %.5f", 
+                                LTFMitigations[size].low, 
+                                LTFMitigations[size].high));
+         }
+      }
+   }
+   
+   LogInfo(StringFormat("%d LTF mitigation zones detected", ArraySize(LTFMitigations)));
+}
+
+//+------------------------------------------------------------------+
+//| Search for ACSD Formations - IMPROVED                          |
+//+------------------------------------------------------------------+
+void SearchForACSDFormations()
+{
+   double high1[], low1[], open1[], close1[];
+   datetime time1[];
+   
+   int copied = CopyHigh(_Symbol, PERIOD_M1, 0, 50, high1);
+   if(copied < 10) 
+   {
+      LogDebug("Insufficient M1 data for ACSD");
+      return;
+   }
+   
+   CopyLow(_Symbol, PERIOD_M1, 0, 50, low1);
+   CopyOpen(_Symbol, PERIOD_M1, 0, 50, open1);
+   CopyClose(_Symbol, PERIOD_M1, 0, 50, close1);
+   CopyTime(_Symbol, PERIOD_M1, 0, 50, time1);
+   
+   // Look for ACSD patterns in ALL bars
+   for(int i = 3; i < copied; i++)
+   {
+      ACSDPattern pattern = DetectACSDPattern(high1, low1, open1, close1, time1, i, copied);
+      
+      if(pattern.confidence > 0)
+      {
+         // BURADA SORUN VAR - Pattern bulunuyor ama array'e eklenmiyor
+         // Direkt ekleyelim
+         int size = ArraySize(ACSDFormations);
+         ArrayResize(ACSDFormations, size + 1);
+         ACSDFormations[size] = pattern;
+         
+         LogInfo(StringFormat("ACSD FOUND AND ADDED: %s @ %.5f (Confidence: %d) - Total ACSD: %d", 
+                             (pattern.direction == 1) ? "BULLISH" : "BEARISH",
+                             pattern.break_price, pattern.confidence,
+                             ArraySize(ACSDFormations)));
+         
+         RetestPhaseActive = true;
+         
+         // Send alert
+         if(EnableAlerts)
+         {
+            Alert(StringFormat("ACSD Pattern: %s @ %.5f", 
+                              (pattern.direction == 1) ? "BULLISH" : "BEARISH",
+                              pattern.break_price));
+         }
+         
+         // Sadece son 5 pattern'i tut
+         if(ArraySize(ACSDFormations) > 5)
+         {
+            // İlk elemanı sil
+            for(int j = 0; j < ArraySize(ACSDFormations) - 1; j++)
+            {
+               ACSDFormations[j] = ACSDFormations[j + 1];
+            }
+            ArrayResize(ACSDFormations, ArraySize(ACSDFormations) - 1);
+         }
+      }
+   }
+   
+   // Debug: Pattern sayısını göster
+   LogDebug(StringFormat("SearchForACSD complete. Total patterns in array: %d", ArraySize(ACSDFormations)));
+}
+
+//+------------------------------------------------------------------+
+//| Detect ACSD Pattern - FIXED                                    |
+//+------------------------------------------------------------------+
+ACSDPattern DetectACSDPattern(double &high[], double &low[], double &open[], double &close[], 
+                              datetime &time[], int current_idx, int array_size)
+{
+   ACSDPattern pattern;
+   pattern.confidence = 0;
+   
+   if(current_idx < 3) return pattern;
+   
+   // Check for color change pattern - DÜZELTİLDİ
+   bool candle_colors[3];
+   for(int i = 0; i < 3; i++)
+   {
+      int idx = current_idx - 2 + i;
+      if(idx < 0 || idx >= array_size) return pattern;
+      candle_colors[i] = (close[idx] > open[idx]);
+   }
+   
+   bool color_change = false;
+   int direction = 0;
+   
+   // Daha basit pattern kontrolü
+   if(candle_colors[0] != candle_colors[2]) // İlk ve son mum farklı renkte
+   {
+      color_change = true;
+      direction = candle_colors[2] ? 1 : -1; // Son mum yeşilse bullish
+   }
+   
+   if(!color_change) return pattern;
+   
+   // Check for strong colored candle
+   double current_body = MathAbs(close[current_idx] - open[current_idx]);
+   double current_range = high[current_idx] - low[current_idx];
+   
+   if(current_range <= 0 || current_body < current_range * 0.5) return pattern; // 0.6'dan 0.5'e düşürdük
+   
+   // Check for structure break - GEVŞETİLDİ
+   bool broken_structure = false;
+   double break_level = 0;
+   
+   if(direction == 1) // Bullish
+   {
+      double recent_high = 0;
+      for(int i = MathMax(0, current_idx - 5); i < current_idx; i++) // 8'den 5'e düşürdük
+      {
+         recent_high = MathMax(recent_high, high[i]);
+      }
+      
+      if(close[current_idx] > recent_high) // Tolerance kaldırıldı
+      {
+         broken_structure = true;
+         break_level = recent_high;
+      }
+   }
+   else // Bearish
+   {
+      double recent_low = DBL_MAX;
+      for(int i = MathMax(0, current_idx - 5); i < current_idx; i++) // 8'den 5'e düşürdük
+      {
+         recent_low = MathMin(recent_low, low[i]);
+      }
+      
+      if(close[current_idx] < recent_low) // Tolerance kaldırıldı
+      {
+         broken_structure = true;
+         break_level = recent_low;
+      }
+   }
+   
+   if(!broken_structure) return pattern;
+   
+   // Protected level kontrolünü basitleştir
+   bool has_protected_level = true; // Her zaman true yap
+   double protected_level = 0;
+   
+   if(direction == 1)
+   {
+      protected_level = low[current_idx - 1]; // Bir önceki mumun low'u
+   }
+   else
+   {
+      protected_level = high[current_idx - 1]; // Bir önceki mumun high'ı
+   }
+   
+   // Create pattern
+   pattern.time_formed = time[current_idx];
+   pattern.break_price = break_level;
+   pattern.direction = direction;
+   pattern.has_protected_level = has_protected_level;
+   pattern.protected_level = protected_level;
+   pattern.in_retest_phase = true;
+   pattern.retest_deadline = time[current_idx] + (RetestTimeoutBars * 60);
+   
+   // Calculate confidence
+   int confidence = 1;
+   
+   if(has_protected_level) confidence += 1;
+   if(current_body > current_range * 0.7) confidence += 1;
+   if(IsNearMitigationZone(close[current_idx])) confidence += 1;
+   
+   pattern.confidence = MathMin(5, confidence);
+   
+   // Debug log
+   LogDebug(StringFormat("ACSD Check: idx=%d, colorChange=%s, dir=%d, break=%s, conf=%d",
+                        current_idx, color_change ? "Y" : "N", direction, 
+                        broken_structure ? "Y" : "N", pattern.confidence));
+   
+   return pattern;
+}
+
+//+------------------------------------------------------------------+
+//| Is Near Mitigation Zone - SIMPLIFIED                            |
+//+------------------------------------------------------------------+
+bool IsNearMitigationZone(double price)
+{
+   // Basitleştirildi - her zaman true döndür test için
+   return true;
+   
+   /*
+   // Check LTF zones
+   for(int i = 0; i < ArraySize(LTFMitigations); i++)
+   {
+      double zone_center = (LTFMitigations[i].high + LTFMitigations[i].low) / 2;
+      if(MathAbs(price - zone_center) < 15 * _Point * 10)
+         return true;
+   }
+   
+   // Check HTF zones
+   for(int i = 0; i < ArraySize(HTFMitigations); i++)
+   {
+      double zone_center = (HTFMitigations[i].high + HTFMitigations[i].low) / 2;
+      if(MathAbs(price - zone_center) < 30 * _Point * 10)
+         return true;
+   }
+   
+   return false;
+   */
+}
+
+//+------------------------------------------------------------------+
+//| Check Active Retests - FIXED                                    |
+//+------------------------------------------------------------------+
+void CheckActiveRetests()
+{
+   datetime current_time = TimeCurrent();
+   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   LogDebug(StringFormat("CheckActiveRetests: %d patterns to check", ArraySize(ACSDFormations)));
+   
+   for(int i = 0; i < ArraySize(ACSDFormations); i++)
+   {
+      if(!ACSDFormations[i].in_retest_phase) 
+      {
+         LogDebug(StringFormat("Pattern %d not in retest phase", i));
+         continue;
+      }
+      
+      // Check timeout
+      if(current_time > ACSDFormations[i].retest_deadline)
+      {
+         ACSDFormations[i].in_retest_phase = false;
+         LogInfo("ACSD retest timeout: " + TimeToString(ACSDFormations[i].time_formed));
+         continue;
+      }
+      
+      // RETEST KONTROLÜNÜ ÇOK BASİTLEŞTİR
+      // Fiyat break level'ı geçti mi kontrol et
+      double break_level = ACSDFormations[i].break_price;
+      bool retest_occurred = false;
+      
+      LogDebug(StringFormat("Checking retest: Break=%.5f, Bid=%.5f, Ask=%.5f, Dir=%d",
+                           break_level, current_bid, current_ask, ACSDFormations[i].direction));
+      
+      if(ACSDFormations[i].direction == 1) // Bullish
+      {
+         // Fiyat break level'ın altına düştü mü?
+         if(current_bid < break_level + (20 * _Point * 10))
+         {
+            retest_occurred = true;
+            LogInfo(StringFormat("BULLISH retest: Bid %.5f < Break %.5f", current_bid, break_level));
+         }
+      }
+      else // Bearish
+      {
+         // Fiyat break level'ın üstüne çıktı mı?
+         if(current_ask > break_level - (20 * _Point * 10))
+         {
+            retest_occurred = true;
+            LogInfo(StringFormat("BEARISH retest: Ask %.5f > Break %.5f", current_ask, break_level));
+         }
+      }
+      
+      if(retest_occurred)
+      {
+         LogInfo("ACSD Retest detected! Creating trade signal...");
+         
+         // Create trade signal
+         TateTradeSignal signal = CreateRetestTradeSignal(ACSDFormations[i]);
+         
+         LogInfo(StringFormat("Signal confidence: %d", signal.confidence));
+         
+         if(signal.confidence > 0)
+         {
+            LogInfo("Executing trade signal...");
+            ExecuteTradeSignal(signal);
+            ACSDFormations[i].in_retest_phase = false; // Mark as used
+         }
+         else
+         {
+            LogError("Signal confidence is 0, not executing");
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Create Retest Trade Signal - FIXED                              |
+//+------------------------------------------------------------------+
+TateTradeSignal CreateRetestTradeSignal(ACSDPattern &acsd)
+{
+   TateTradeSignal signal;
+   signal.confidence = 0;
+   
+   LogDebug("Creating retest signal...");
+   
+   // Calculate entry, SL, and TP
+   double entry_price = (acsd.direction == 1) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double stop_loss = CalculateStopLoss(acsd, entry_price);
+   double take_profit = CalculateTakeProfit(acsd, entry_price, stop_loss);
+   
+   // Validate prices
+   if(stop_loss <= 0 || take_profit <= 0)
+   {
+      LogDebug("Invalid SL or TP calculated");
+      // Basit SL/TP ata
+      if(acsd.direction == 1) // Buy
+      {
+         stop_loss = entry_price - (50 * _Point * 10);
+         take_profit = entry_price + (100 * _Point * 10);
+      }
+      else // Sell
+      {
+         stop_loss = entry_price + (50 * _Point * 10);
+         take_profit = entry_price - (100 * _Point * 10);
+      }
+   }
+   
+   // Calculate risk/reward
+   double risk = MathAbs(entry_price - stop_loss);
+   double reward = MathAbs(take_profit - entry_price);
+   double rr_ratio = (risk > 0) ? reward / risk : 2.0; // Default 2.0
+   
+   // Create signal - HER ZAMAN OLUŞTUR
+   signal.entry_price = entry_price;
+   signal.stop_loss = stop_loss;
+   signal.take_profit = take_profit;
+   signal.risk_reward = rr_ratio;
+   signal.direction = acsd.direction;
+   signal.signal_time = TimeCurrent();
+   signal.confidence = 1; // HER ZAMAN 1 VER
+   signal.formation_type = "ACSD_RETEST";
+   signal.is_retest_entry = true;
+   
+   LogInfo(StringFormat("Trade signal created: %s @ %.5f, SL: %.5f, TP: %.5f, RR: %.2f",
+                       (signal.direction == 1) ? "BUY" : "SELL",
+                       signal.entry_price, signal.stop_loss, signal.take_profit, signal.risk_reward));
+   
+   return signal;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Stop Loss - IMPROVED                                  |
+//+------------------------------------------------------------------+
+double CalculateStopLoss(ACSDPattern &acsd, double entry_price)
+{
+   double stop_loss = 0;
+   double liquidity_level = FindNearestLiquidityLevel(acsd.direction, entry_price);
+   
+   if(liquidity_level > 0)
+   {
+      double buffer = LiquidityBuffer * _Point * 10;
+      
+      if(acsd.direction == 1) // Buy
+         stop_loss = liquidity_level - buffer;
+      else // Sell
+         stop_loss = liquidity_level + buffer;
+   }
+   else
+   {
+      // Use protected level or break level
+      if(acsd.has_protected_level)
+      {
+         double buffer = 5 * _Point * 10;
+         if(acsd.direction == 1)
+            stop_loss = acsd.protected_level - buffer;
+         else
+            stop_loss = acsd.protected_level + buffer;
+      }
+      else
+      {
+         double buffer = 10 * _Point * 10;
+         if(acsd.direction == 1)
+            stop_loss = acsd.break_price - buffer;
+         else
+            stop_loss = acsd.break_price + buffer;
+      }
+   }
+   
+   // Validate stop loss
+   if(acsd.direction == 1) // Buy
+   {
+      if(stop_loss >= entry_price)
+         stop_loss = entry_price - (20 * _Point * 10);
+   }
+   else // Sell
+   {
+      if(stop_loss <= entry_price)
+         stop_loss = entry_price + (20 * _Point * 10);
+   }
+   
+   return NormalizeDouble(stop_loss, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Take Profit - IMPROVED                                |
+//+------------------------------------------------------------------+
+double CalculateTakeProfit(ACSDPattern &acsd, double entry_price, double stop_loss)
+{
+   double take_profit = 0;
+   
+   // Try to find targets
+   double equal_target = FindEqualLevelTarget(acsd.direction, entry_price);
+   double fvg_target = FindFVGTarget(acsd.direction, entry_price);
+   double swing_target = FindSwingTarget(acsd.direction, entry_price);
+   
+   // Select best target
+   if(equal_target > 0)
+   {
+      take_profit = equal_target;
+   }
+   else if(fvg_target > 0)
+   {
+      take_profit = fvg_target;
+   }
+   else if(swing_target > 0)
+   {
+      take_profit = swing_target;
+   }
+   else
+   {
+      // Use minimum RR ratio
+      double risk = MathAbs(entry_price - stop_loss);
+      if(acsd.direction == 1) // Buy
+         take_profit = entry_price + (risk * MinRiskReward);
+      else // Sell
+         take_profit = entry_price - (risk * MinRiskReward);
+   }
+   
+   // Validate take profit
+   if(acsd.direction == 1) // Buy
+   {
+      if(take_profit <= entry_price)
+         take_profit = entry_price + (MathAbs(entry_price - stop_loss) * MinRiskReward);
+   }
+   else // Sell
+   {
+      if(take_profit >= entry_price)
+         take_profit = entry_price - (MathAbs(entry_price - stop_loss) * MinRiskReward);
+   }
+   
+   return NormalizeDouble(take_profit, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Find Nearest Liquidity Level                                    |
+//+------------------------------------------------------------------+
+double FindNearestLiquidityLevel(int direction, double reference_price)
+{
+   double nearest_level = 0;
+   double min_distance = DBL_MAX;
+   
+   // Check equal levels
+   for(int i = 0; i < ArraySize(EqualLevels); i++)
+   {
+      if(EqualLevels[i].cleared) continue;
+      
+      double distance = MathAbs(EqualLevels[i].price - reference_price);
+      
+      if(direction == 1 && EqualLevels[i].price >= reference_price) continue;
+      if(direction == -1 && EqualLevels[i].price <= reference_price) continue;
+      
+      if(distance < min_distance && distance > 5 * _Point * 10)
+      {
+         min_distance = distance;
+         nearest_level = EqualLevels[i].price;
+      }
+   }
+   
+   // Check swing points
+   for(int i = 0; i < ArraySize(SwingPoints); i++)
+   {
+      double distance = MathAbs(SwingPoints[i].price - reference_price);
+      
+      if(direction == 1 && SwingPoints[i].price >= reference_price) continue;
+      if(direction == -1 && SwingPoints[i].price <= reference_price) continue;
+      
+      if(distance < min_distance && distance > 5 * _Point * 10)
+      {
+         min_distance = distance;
+         nearest_level = SwingPoints[i].price;
+      }
+   }
+   
+   return nearest_level;
+}
+
+//+------------------------------------------------------------------+
+//| Find Equal Level Target                                         |
+//+------------------------------------------------------------------+
+double FindEqualLevelTarget(int direction, double entry_price)
+{
+   double best_target = 0;
+   double min_distance = DBL_MAX;
+   
+   for(int i = 0; i < ArraySize(EqualLevels); i++)
+   {
+      if(EqualLevels[i].cleared) continue;
+      
+      double distance = MathAbs(EqualLevels[i].price - entry_price);
+      
+      if(direction == 1 && EqualLevels[i].price > entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = EqualLevels[i].price + (3 * _Point * 10);
+      }
+      else if(direction == -1 && EqualLevels[i].price < entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = EqualLevels[i].price - (3 * _Point * 10);
+      }
+   }
+   
+   return best_target;
+}
+
+//+------------------------------------------------------------------+
+//| Find FVG Target                                                 |
+//+------------------------------------------------------------------+
+double FindFVGTarget(int direction, double entry_price)
+{
+   double best_target = 0;
+   double min_distance = DBL_MAX;
+   
+   for(int i = 0; i < ArraySize(FVGZones); i++)
+   {
+      if(FVGZones[i].filled || !FVGZones[i].can_be_target) continue;
+      
+      double fvg_center = (FVGZones[i].high + FVGZones[i].low) / 2;
+      double distance = MathAbs(fvg_center - entry_price);
+      
+      if(direction == 1 && fvg_center > entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = FVGZones[i].low;
+      }
+      else if(direction == -1 && fvg_center < entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = FVGZones[i].high;
+      }
+   }
+   
+   return best_target;
+}
+
+//+------------------------------------------------------------------+
+//| Find Swing Target                                               |
+//+------------------------------------------------------------------+
+double FindSwingTarget(int direction, double entry_price)
+{
+   double best_target = 0;
+   double min_distance = DBL_MAX;
+   
+   for(int i = 0; i < ArraySize(SwingPoints); i++)
+   {
+      double distance = MathAbs(SwingPoints[i].price - entry_price);
+      
+      if(direction == 1 && SwingPoints[i].is_high && SwingPoints[i].price > entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = SwingPoints[i].price;
+      }
+      else if(direction == -1 && !SwingPoints[i].is_high && SwingPoints[i].price < entry_price && distance < min_distance)
+      {
+         min_distance = distance;
+         best_target = SwingPoints[i].price;
+      }
+   }
+   
+   return best_target;
+}
+
+//+------------------------------------------------------------------+
+//| Check if Equal Levels are Cleared                               |
+//+------------------------------------------------------------------+
+bool AreEqualLevelsCleared(int direction)
+{
+   double high[], low[];
+   int copied = CopyHigh(_Symbol, PERIOD_M1, 0, 15, high);
+   if(copied < 10) return true; // Default to true if no data
+   
+   CopyLow(_Symbol, PERIOD_M1, 0, 15, low);
+   
+   double latest_high = high[copied - 1];
+   double latest_low = low[copied - 1];
+   
+   double recent_max = high[0];
+   double recent_min = low[0];
+   
+   for(int i = 1; i < copied - 1; i++)
+   {
+      recent_max = MathMax(recent_max, high[i]);
+      recent_min = MathMin(recent_min, low[i]);
+   }
+   
+   if(direction == 1) // Bullish
+   {
+      return (latest_high > recent_max);
+   }
+   else // Bearish
+   {
+      return (latest_low < recent_min);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| FVG Strength Test                                               |
+//+------------------------------------------------------------------+
+bool PassesFVGStrengthTest(int direction)
+{
+   // If no FVG zones, pass the test
+   if(ArraySize(FVGZones) == 0) return true;
+   
+   double current_price = (direction == 1) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // Check if price is in any FVG zone
+   for(int i = 0; i < ArraySize(FVGZones); i++)
+   {
+      if(FVGZones[i].filled) continue;
+      
+      if(current_price >= FVGZones[i].low && current_price <= FVGZones[i].high)
+      {
+         FVGZones[i].strength_tested = true;
+         FVGZones[i].test_price = current_price;
+         
+         // Check market reaction
+         bool filled_but_no_continuation = true;
+         
+         double high[], low[];
+         int copied = CopyHigh(_Symbol, PERIOD_M1, 0, 5, high);
+         if(copied >= 3)
+         {
+            CopyLow(_Symbol, PERIOD_M1, 0, 5, low);
+            
+            if(direction == 1) // Bullish
+            {
+               if(high[copied-1] <= high[copied-3])
+               {
+                  FVGZones[i].can_be_target = true;
+                  filled_but_no_continuation = true;
+               }
+               else
+               {
+                  filled_but_no_continuation = false;
+               }
+            }
+            else // Bearish
+            {
+               if(low[copied-1] >= low[copied-3])
+               {
+                  FVGZones[i].can_be_target = true;
+                  filled_but_no_continuation = true;
+               }
+               else
+               {
+                  filled_but_no_continuation = false;
+               }
+            }
+         }
+         
+         return filled_but_no_continuation;
+      }
+   }
+   
+   return true; // Pass if not in FVG
+}
+
+//+------------------------------------------------------------------+
+//| Check New High/Low Breaks                                       |
+//+------------------------------------------------------------------+
+void CheckNewHighLowBreaks()
+{
+   double high[], low[];
+   int copied = CopyHigh(_Symbol, PERIOD_M1, 0, 10, high);
+   if(copied < 5) return;
+   
+   CopyLow(_Symbol, PERIOD_M1, 0, 10, low);
+   
+   double latest_high = high[copied - 1];
+   double latest_low = low[copied - 1];
+   
+   double prev_high_max = 0;
+   double prev_low_min = DBL_MAX;
+   
+   for(int i = 0; i < copied - 1; i++)
+   {
+      prev_high_max = MathMax(prev_high_max, high[i]);
+      prev_low_min = MathMin(prev_low_min, low[i]);
+   }
+   
+   // Check if new high
+   if(latest_high > prev_high_max)
+   {
+      for(int i = 0; i < ArraySize(EqualLevels); i++)
+      {
+         if(EqualLevels[i].price <= latest_high && !EqualLevels[i].cleared)
+         {
+            EqualLevels[i].cleared = true;
+            LogDebug(StringFormat("Equal level cleared: %.5f", EqualLevels[i].price));
+         }
+      }
+   }
+   
+   // Check if new low
+   if(latest_low < prev_low_min)
+   {
+      for(int i = 0; i < ArraySize(EqualLevels); i++)
+      {
+         if(EqualLevels[i].price >= latest_low && !EqualLevels[i].cleared)
+         {
+            EqualLevels[i].cleared = true;
+            LogDebug(StringFormat("Equal level cleared: %.5f", EqualLevels[i].price));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update Equal Levels                                             |
+//+------------------------------------------------------------------+
+void UpdateEqualLevels()
+{
+   // Remove old levels
+   datetime cutoff_time = TimeCurrent() - 3600;
+   for(int i = ArraySize(EqualLevels) - 1; i >= 0; i--)
+   {
+      if(EqualLevels[i].last_touch < cutoff_time)
+      {
+         for(int j = i; j < ArraySize(EqualLevels) - 1; j++)
+         {
+            EqualLevels[j] = EqualLevels[j + 1];
+         }
+         ArrayResize(EqualLevels, ArraySize(EqualLevels) - 1);
+      }
+   }
+   
+   double high[], low[];
+   datetime time[];
+   
+   int copied = CopyHigh(_Symbol, PERIOD_M5, 0, 100, high);
+   if(copied < 20) return;
+   
+   CopyLow(_Symbol, PERIOD_M5, 0, 100, low);
+   CopyTime(_Symbol, PERIOD_M5, 0, 100, time);
+   
+   double tolerance = TolerancePips * _Point * 10;
+   
+   // Find equal highs
+   for(int i = 0; i < copied; i++)
+   {
+      int high_touch_count = 0;
+      datetime last_high_touch = 0;
+      
+      for(int j = 0; j < copied; j++)
+      {
+         if(MathAbs(high[i] - high[j]) <= tolerance)
+         {
+            high_touch_count++;
+            last_high_touch = MathMax(last_high_touch, time[j]);
+         }
+      }
+      
+      if(high_touch_count >= 3)
+      {
+         bool exists = false;
+         for(int k = 0; k < ArraySize(EqualLevels); k++)
+         {
+            if(MathAbs(EqualLevels[k].price - high[i]) <= tolerance)
+            {
+               EqualLevels[k].touch_count = MathMax(EqualLevels[k].touch_count, high_touch_count);
+               EqualLevels[k].last_touch = MathMax(EqualLevels[k].last_touch, last_high_touch);
+               exists = true;
+               break;
+            }
+         }
+         
+         if(!exists)
+         {
+            int size = ArraySize(EqualLevels);
+            ArrayResize(EqualLevels, size + 1);
+            
+            EqualLevels[size].price = high[i];
+            EqualLevels[size].touch_count = high_touch_count;
+            EqualLevels[size].last_touch = last_high_touch;
+            EqualLevels[size].cleared = false;
+            EqualLevels[size].is_liquidity_pool = (high_touch_count >= 4);
+         }
+      }
+      
+      // Find equal lows
+      int low_touch_count = 0;
+      datetime last_low_touch = 0;
+      
+      for(int j = 0; j < copied; j++)
+      {
+         if(MathAbs(low[i] - low[j]) <= tolerance)
+         {
+            low_touch_count++;
+            last_low_touch = MathMax(last_low_touch, time[j]);
+         }
+      }
+      
+      if(low_touch_count >= 3)
+      {
+         bool exists = false;
+         for(int k = 0; k < ArraySize(EqualLevels); k++)
+         {
+            if(MathAbs(EqualLevels[k].price - low[i]) <= tolerance)
+            {
+               EqualLevels[k].touch_count = MathMax(EqualLevels[k].touch_count, low_touch_count);
+               EqualLevels[k].last_touch = MathMax(EqualLevels[k].last_touch, last_low_touch);
+               exists = true;
+               break;
+            }
+         }
+         
+         if(!exists)
+         {
+            int size = ArraySize(EqualLevels);
+            ArrayResize(EqualLevels, size + 1);
+            
+            EqualLevels[size].price = low[i];
+            EqualLevels[size].touch_count = low_touch_count;
+            EqualLevels[size].last_touch = last_low_touch;
+            EqualLevels[size].cleared = false;
+            EqualLevels[size].is_liquidity_pool = (low_touch_count >= 4);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect FVG Zones                                                |
+//+------------------------------------------------------------------+
+void DetectFVGZones()
+{
+   // Remove old FVG zones
+   datetime cutoff_time = TimeCurrent() - 3600;
+   for(int i = ArraySize(FVGZones) - 1; i >= 0; i--)
+   {
+      if(FVGZones[i].time_formed < cutoff_time)
+      {
+         for(int j = i; j < ArraySize(FVGZones) - 1; j++)
+         {
+            FVGZones[j] = FVGZones[j + 1];
+         }
+         ArrayResize(FVGZones, ArraySize(FVGZones) - 1);
+      }
+   }
+   
+   double high[], low[], open[], close[];
+   datetime time[];
+   
+   int copied = CopyHigh(_Symbol, PERIOD_M5, 0, 100, high);
+   if(copied < 10) return;
+   
+   CopyLow(_Symbol, PERIOD_M5, 0, 100, low);
+   CopyOpen(_Symbol, PERIOD_M5, 0, 100, open);
+   CopyClose(_Symbol, PERIOD_M5, 0, 100, close);
+   CopyTime(_Symbol, PERIOD_M5, 0, 100, time);
+   
+   double min_gap = MinGapPips * _Point * 10;
+   
+   // Look for FVG patterns
+   for(int i = 1; i < copied - 1; i++)
+   {
+      // Bullish FVG: low[i-1] > high[i+1]
+      if(low[i-1] > high[i+1] && (low[i-1] - high[i+1]) >= min_gap)
+      {
+         bool exists = false;
+         for(int j = 0; j < ArraySize(FVGZones); j++)
+         {
+            if(MathAbs(FVGZones[j].time_formed - time[i]) < 300)
+            {
+               exists = true;
+               break;
+            }
+         }
+         
+         if(!exists)
+         {
+            int size = ArraySize(FVGZones);
+            ArrayResize(FVGZones, size + 1);
+            
+            FVGZones[size].high = low[i-1];
+            FVGZones[size].low = high[i+1];
+            FVGZones[size].time_formed = time[i];
+            FVGZones[size].is_bullish = true;
+            FVGZones[size].filled = false;
+            FVGZones[size].strength_tested = false;
+            FVGZones[size].can_be_target = false;
+            
+            LogDebug(StringFormat("Bullish FVG: %.5f - %.5f", FVGZones[size].low, FVGZones[size].high));
+         }
+      }
+      
+      // Bearish FVG: high[i-1] < low[i+1]
+      if(high[i-1] < low[i+1] && (low[i+1] - high[i-1]) >= min_gap)
+      {
+         bool exists = false;
+         for(int j = 0; j < ArraySize(FVGZones); j++)
+         {
+            if(MathAbs(FVGZones[j].time_formed - time[i]) < 300)
+            {
+               exists = true;
+               break;
+            }
+         }
+         
+         if(!exists)
+         {
+            int size = ArraySize(FVGZones);
+            ArrayResize(FVGZones, size + 1);
+            
+            FVGZones[size].high = low[i+1];
+            FVGZones[size].low = high[i-1];
+            FVGZones[size].time_formed = time[i];
+            FVGZones[size].is_bullish = false;
+            FVGZones[size].filled = false;
+            FVGZones[size].strength_tested = false;
+            FVGZones[size].can_be_target = false;
+            
+            LogDebug(StringFormat("Bearish FVG: %.5f - %.5f", FVGZones[size].low, FVGZones[size].high));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update Swing Points                                             |
+//+------------------------------------------------------------------+
+void UpdateSwingPoints()
+{
+   ArrayResize(SwingPoints, 0);
+   
+   double high[], low[];
+   datetime time[];
+   
+   int copied = CopyHigh(_Symbol, PERIOD_M15, 0, 50, high);
+   if(copied < 10) return;
+   
+   CopyLow(_Symbol, PERIOD_M15, 0, 50, low);
+   CopyTime(_Symbol, PERIOD_M15, 0, 50, time);
+   
+   // Find swing highs
+   for(int i = 2; i < copied - 2; i++)
+   {
+      if(high[i] > high[i-1] && high[i] > high[i-2] && 
+         high[i] > high[i+1] && high[i] > high[i+2])
+      {
+         double strength_factor = 0;
+         strength_factor += (high[i] - high[i-1]) + (high[i] - high[i+1]);
+         strength_factor += (high[i] - high[i-2]) + (high[i] - high[i+2]);
+         
+         int strength = (int)MathMin(5, strength_factor / (_Point * 50));
+         
+         if(strength >= 2)
+         {
+            int size = ArraySize(SwingPoints);
+            ArrayResize(SwingPoints, size + 1);
+            
+            SwingPoints[size].price = high[i];
+            SwingPoints[size].time = time[i];
+            SwingPoints[size].is_high = true;
+            SwingPoints[size].strength = strength;
+            SwingPoints[size].swing_protected = false;
+         }
+      }
+      
+      // Find swing lows
+      if(low[i] < low[i-1] && low[i] < low[i-2] && 
+         low[i] < low[i+1] && low[i] < low[i+2])
+      {
+         double strength_factor = 0;
+         strength_factor += (low[i-1] - low[i]) + (low[i+1] - low[i]);
+         strength_factor += (low[i-2] - low[i]) + (low[i+2] - low[i]);
+         
+         int strength = (int)MathMin(5, strength_factor / (_Point * 50));
+         
+         if(strength >= 2)
+         {
+            int size = ArraySize(SwingPoints);
+            ArrayResize(SwingPoints, size + 1);
+            
+            SwingPoints[size].price = low[i];
+            SwingPoints[size].time = time[i];
+            SwingPoints[size].is_high = false;
+            SwingPoints[size].strength = strength;
+            SwingPoints[size].swing_protected = false;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Test FVG Strength/Weakness                                      |
+//+------------------------------------------------------------------+
+void TestFVGStrengthWeakness()
+{
+   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   for(int i = 0; i < ArraySize(FVGZones); i++)
+   {
+      if(FVGZones[i].filled) continue;
+      
+      double current_price = (FVGZones[i].is_bullish) ? current_bid : current_ask;
+      
+      // Check if price is in FVG zone
+      if(current_price >= FVGZones[i].low && current_price <= FVGZones[i].high)
+      {
+         if(!FVGZones[i].strength_tested)
+         {
+            FVGZones[i].strength_tested = true;
+            FVGZones[i].test_price = current_price;
+            LogDebug(StringFormat("FVG strength test started: %.5f", current_price));
+         }
+         
+         // Check if new level created after test
+         bool new_level_created = CheckNewLevelAfterFVGTest(FVGZones[i]);
+         
+         if(!new_level_created)
+         {
+            FVGZones[i].can_be_target = true;
+            LogDebug("FVG showed weakness - can be target");
+         }
+      }
+      
+      // Mark as filled if price has passed through
+      if(FVGZones[i].is_bullish)
+      {
+         if(current_bid <= FVGZones[i].low)
+            FVGZones[i].filled = true;
+      }
+      else
+      {
+         if(current_ask >= FVGZones[i].high)
+            FVGZones[i].filled = true;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check New Level After FVG Test                                  |
+//+------------------------------------------------------------------+
+bool CheckNewLevelAfterFVGTest(FVGZone &fvg)
+{
+   double high[], low[];
+   int copied = CopyHigh(_Symbol, PERIOD_M1, 0, 10, high);
+   if(copied < 5) return false;
+   
+   CopyLow(_Symbol, PERIOD_M1, 0, 10, low);
+   
+   double recent_high = high[copied-1];
+   double recent_low = low[copied-1];
+   
+   double pre_test_high = 0;
+   double pre_test_low = DBL_MAX;
+   
+   for(int i = 0; i < copied - 3; i++)
+   {
+      pre_test_high = MathMax(pre_test_high, high[i]);
+      pre_test_low = MathMin(pre_test_low, low[i]);
+   }
+   
+   if(fvg.is_bullish)
+   {
+      return (recent_high > pre_test_high);
+   }
+   else
+   {
+      return (recent_low < pre_test_low);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check Equal Levels Clearing                                     |
+//+------------------------------------------------------------------+
+void CheckEqualLevelsClearing()
+{
+   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   for(int i = 0; i < ArraySize(EqualLevels); i++)
+   {
+      if(EqualLevels[i].cleared) continue;
+      
+      if((current_ask > EqualLevels[i].price && current_bid > EqualLevels[i].price) ||
+         (current_ask < EqualLevels[i].price && current_bid < EqualLevels[i].price))
+      {
+         EqualLevels[i].cleared = true;
+         LogInfo(StringFormat("Equal level cleared: %.5f", EqualLevels[i].price));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Generate Trade Signal If Ready                                  |
+//+------------------------------------------------------------------+
+void GenerateTradeSignalIfReady()
+{
+   // Check if we have active retest
+   bool active_retest = false;
+   for(int i = 0; i < ArraySize(ACSDFormations); i++)
+   {
+      if(ACSDFormations[i].in_retest_phase)
+      {
+         active_retest = true;
+         break;
+      }
+   }
+   
+   if(!active_retest)
+   {
+      RetestPhaseActive = false;
+   }
+   
+   // Additional signal generation logic can be added here
+   // For now, we primarily rely on ACSD retest signals
+}
+
+//+------------------------------------------------------------------+
+//| Execute Trade Signal - FIXED                                    |
+//+------------------------------------------------------------------+
+void ExecuteTradeSignal(TateTradeSignal &signal)
+{
+   // Final checks
+   if(!CheckRiskLimits()) 
+   {
+      LogError("Risk limits exceeded - trade cancelled");
+      return;
+   }
+   
+   if(DailyTradeCount >= MaxDailyTrades) 
+   {
+      LogError("Daily trade limit reached - trade cancelled");
+      return;
+   }
+   
+   if(HasOpenPosition())
+   {
+      LogError("Position already open - trade cancelled");
+      return;
+   }
+   
+   // Calculate position size
+   double lot_size = CalculatePositionSize(signal.entry_price, signal.stop_loss);
+   
+   if(lot_size <= 0)
+   {
+      LogError("Invalid lot size calculated");
+      return;
+   }
+   
+   // Symbol bilgilerini kontrol et
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   LogInfo(StringFormat("Symbol info: MinLot=%.2f, MaxLot=%.2f, Step=%.2f, CalcLot=%.2f", 
+                       min_lot, max_lot, lot_step, lot_size));
+   
+   // Prepare trade request
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   
+   ZeroMemory(request);
+   ZeroMemory(result);
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lot_size;
+   request.type = (signal.direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.price = signal.entry_price;
+   request.sl = signal.stop_loss;
+   request.tp = signal.take_profit;
+   request.deviation = 50; // 20'den 50'ye çıkarıldı
+   request.magic = MagicNumber;
+   request.comment = StringFormat("Tate_%s_%s", 
+                                  (signal.direction == 1) ? "LONG" : "SHORT",
+                                  signal.formation_type);
+   
+   // Request bilgilerini logla
+   LogInfo(StringFormat("Trade Request: %s %.2f lots @ %.5f, SL=%.5f, TP=%.5f",
+                       (request.type == ORDER_TYPE_BUY) ? "BUY" : "SELL",
+                       request.volume, request.price, request.sl, request.tp));
+   
+   // Send order
+   bool success = OrderSend(request, result);
+   
+   LogInfo(StringFormat("OrderSend result: success=%s, retcode=%d, deal=%d, order=%d",
+                       success ? "true" : "false", result.retcode, result.deal, result.order));
+   
+   if(success && result.retcode == TRADE_RETCODE_DONE)
+   {
+      TotalTrades++;
+      DailyTradeCount++;
+      
+      string direction_str = (signal.direction == 1) ? "LONG" : "SHORT";
+      
+      LogInfo(StringFormat("Trade opened: %s", signal.formation_type));
+      LogInfo(StringFormat("Direction: %s | Lot: %.2f | Price: %.5f", 
+                          direction_str, lot_size, result.price));
+      LogInfo(StringFormat("SL: %.5f | TP: %.5f | RR: %.2f", 
+                          signal.stop_loss, signal.take_profit, signal.risk_reward));
+      
+      if(EnableAlerts)
+      {
+         Alert(StringFormat("Tate Bot: %s %s @ %.5f (RR: %.2f)", 
+                           signal.formation_type, direction_str, result.price, signal.risk_reward));
+      }
+   }
+   else
+   {
+      LogError(StringFormat("Trade error: %d - %s", result.retcode, result.comment));
+      
+      // Log detailed error info
+      switch(result.retcode)
+      {
+         case TRADE_RETCODE_INVALID_PRICE:
+            LogError("Invalid price - check spread and slippage");
+            break;
+         case TRADE_RETCODE_INVALID_STOPS:
+            LogError(StringFormat("Invalid stops - Broker StopLevel: %d points", 
+                                 (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)));
+            break;
+         case TRADE_RETCODE_NO_MONEY:
+            LogError(StringFormat("Insufficient funds - Required margin: %.2f, Free margin: %.2f",
+                                 AccountInfoDouble(ACCOUNT_MARGIN_FREE)));
+            break;
+         case TRADE_RETCODE_INVALID_VOLUME:
+            LogError(StringFormat("Invalid volume: %.2f (min: %.2f, max: %.2f, step: %.2f)", 
+                                 lot_size, min_lot, max_lot, lot_step));
+            break;
+         case TRADE_RETCODE_MARKET_CLOSED:
+            LogError("Market is closed");
+            break;
+         case TRADE_RETCODE_TRADE_DISABLED:
+            LogError("Trading is disabled for this symbol");
+            break;
+         default:
+            LogError(StringFormat("Other error: %d", result.retcode));
+      }
+         
+      if(EnableAlerts)
+         Alert(StringFormat("Tate Bot Trade Error: %s", result.comment));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Position Size - IMPROVED                              |
+//+------------------------------------------------------------------+
+double CalculatePositionSize(double entry_price, double stop_loss)
+{
+   // Basit lot size hesaplama - test için
+   double lot_size = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   
+   LogDebug(StringFormat("Position size: %.2f (using minimum lot for testing)", lot_size));
+   
+   return lot_size;
+   
+   /* ORİJİNAL HESAPLAMA - TEST SONRASI AKTİF EDİLEBİLİR
+   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amount = account_balance * RiskPerTrade / 100.0;
+   
+   double sl_distance = MathAbs(entry_price - stop_loss);
+   if(sl_distance <= 0) 
+   {
+      LogError("Invalid SL distance");
+      return 0;
+   }
+   
+   // Get symbol specifications
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   if(tick_size == 0 || point == 0) 
+   {
+      LogError("Invalid symbol specifications");
+      return 0;
+   }
+   
+   // Calculate position size
+   double pip_value = tick_value * (point * 10 / tick_size);
+   double sl_distance_pips = sl_distance / (point * 10);
+   
+   double position_size = risk_amount / (sl_distance_pips * pip_value);
+   
+   // Apply symbol limits
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   // Round to lot step
+   position_size = MathRound(position_size / lot_step) * lot_step;
+   
+   // Apply limits
+   position_size = MathMax(min_lot, MathMin(position_size, max_lot));
+   
+   // Double check margin
+   double margin_required = 0;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, position_size, entry_price, margin_required))
+   {
+      LogError("Failed to calculate margin");
+      return 0;
+   }
+   
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(margin_required > free_margin * 0.9) // Use max 90% of free margin
+   {
+      position_size = (free_margin * 0.9 / margin_required) * position_size;
+      position_size = MathRound(position_size / lot_step) * lot_step;
+      position_size = MathMax(min_lot, position_size);
+   }
+   
+   LogDebug(StringFormat("Position size calculated: %.2f lots", position_size));
+   
+   return position_size;
+   */
+}
+
+//+------------------------------------------------------------------+
+//| Check ACSD Timeouts                                             |
+//+------------------------------------------------------------------+
+void CheckACSDTimeouts()
+{
+   datetime current_time = TimeCurrent();
+   
+   for(int i = 0; i < ArraySize(ACSDFormations); i++)
+   {
+      if(ACSDFormations[i].in_retest_phase && 
+         current_time > ACSDFormations[i].retest_deadline)
+      {
+         ACSDFormations[i].in_retest_phase = false;
+         LogInfo(StringFormat("ACSD retest timeout: %s", 
+                             TimeToString(ACSDFormations[i].time_formed)));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check Risk Limits                                               |
+//+------------------------------------------------------------------+
+bool CheckRiskLimits()
+{
+   double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double daily_loss_limit = InitialBalance * MaxDailyLoss / 100.0;
+   
+   // Check daily loss
+   if(DailyPnL <= -daily_loss_limit)
+   {
+      LogError(StringFormat("Daily loss limit exceeded: %.2f", DailyPnL));
+      if(EnableAlerts)
+         Alert("Tate Bot: Daily loss limit exceeded!");
+      return false;
+   }
+   
+   // Check max drawdown
+   double drawdown = (InitialBalance - current_equity) / InitialBalance * 100.0;
+   
+   if(drawdown >= MaxDrawdown)
+   {
+      LogError(StringFormat("Maximum drawdown exceeded: %.2f%%", drawdown));
+      if(EnableAlerts)
+         Alert("Tate Bot: Maximum drawdown exceeded!");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Market Session                                             |
+//+------------------------------------------------------------------+
+bool IsMarketSessionActive()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt); // GMTOffset'i kaldırdım
+   
+   int current_hour = dt.hour;
+   
+   // Daha geniş trading saatleri
+   if(current_hour >= 1 && current_hour <= 23) // Neredeyse tüm gün
+      return true;
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Monitor Open Positions                                          |
+//+------------------------------------------------------------------+
+void MonitorOpenPositions()
+{
+   double total_profit = 0;
+   int position_count = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         total_profit += profit;
+         position_count++;
+         
+         // Add trailing stop logic here if needed
+      }
+   }
+   
+   DailyPnL = total_profit;
+   
+   if(position_count > 0)
+   {
+      LogDebug(StringFormat("Open positions: %d, P&L: %.2f", position_count, total_profit));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset Daily Counters                                            |
+//+------------------------------------------------------------------+
+void ResetDailyCounters()
+{
+   datetime current_date = TimeCurrent();
+   MqlDateTime dt_current, dt_last;
+   
+   TimeToStruct(current_date, dt_current);
+   TimeToStruct(LastTradeDate, dt_last);
+   
+   if(dt_current.day != dt_last.day || dt_current.mon != dt_last.mon)
+   {
+      DailyTradeCount = 0;
+      DailyPnL = 0.0;
+      LastTradeDate = current_date;
+      
+      LogInfo("New trading day - counters reset");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update Chart Display                                             |
+//+------------------------------------------------------------------+
+void UpdateChartDisplay()
+{
+   if(!DrawZones) return;
+   
+   CleanupChartObjects();
+   DrawHTFMitigationZones();
+   DrawLTFMitigationZones();
+   DrawFVGZones();
+   DrawEqualLevels();
+   DrawACSDFormations();
+   UpdateInfoPanel();
+   UpdateChartComment();
+}
+
+//+------------------------------------------------------------------+
+//| Cleanup Chart Objects                                           |
+//+------------------------------------------------------------------+
+void CleanupChartObjects()
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string obj_name = ObjectName(0, i);
+      if(StringFind(obj_name, "Tate_") == 0)
+      {
+         ObjectDelete(0, obj_name);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw HTF Mitigation Zones                                       |
+//+------------------------------------------------------------------+
+void DrawHTFMitigationZones()
+{
+   for(int i = 0; i < ArraySize(HTFMitigations); i++)
+   {
+      if(!HTFMitigations[i].still_valid) continue;
+      
+      string obj_name = StringFormat("Tate_HTF_Mit_%d", i);
+      
+      ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0,
+                   HTFMitigations[i].time_formed, HTFMitigations[i].high,
+                   TimeCurrent() + 3600, HTFMitigations[i].low);
+      
+      color zone_color = HTFMitigations[i].is_bullish ? clrDarkGreen : clrDarkRed;
+      ObjectSetInteger(0, obj_name, OBJPROP_COLOR, zone_color);
+      ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+      ObjectSetString(0, obj_name, OBJPROP_TOOLTIP,
+                      StringFormat("HTF Mitigation %s (Strength: %d)",
+                                   HTFMitigations[i].is_bullish ? "Bullish" : "Bearish",
+                                   HTFMitigations[i].strength));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw LTF Mitigation Zones                                       |
+//+------------------------------------------------------------------+
+void DrawLTFMitigationZones()
+{
+   for(int i = 0; i < ArraySize(LTFMitigations); i++)
+   {
+      string obj_name = StringFormat("Tate_LTF_Mit_%d", i);
+      
+      ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0,
+                   LTFMitigations[i].time_formed, LTFMitigations[i].high,
+                   TimeCurrent() + 1800, LTFMitigations[i].low);
+      
+      color zone_color = LTFMitigations[i].is_bullish ? clrLimeGreen : clrOrangeRed;
+      ObjectSetInteger(0, obj_name, OBJPROP_COLOR, zone_color);
+      ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+      ObjectSetString(0, obj_name, OBJPROP_TOOLTIP, "LTF Mitigation");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw FVG Zones                                                  |
+//+------------------------------------------------------------------+
+void DrawFVGZones()
+{
+   for(int i = 0; i < ArraySize(FVGZones); i++)
+   {
+      if(FVGZones[i].filled) continue;
+      
+      string obj_name = StringFormat("Tate_FVG_%d", i);
+      
+      ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0,
+                   FVGZones[i].time_formed, FVGZones[i].high,
+                   TimeCurrent() + 900, FVGZones[i].low);
+      
+      color fvg_color = FVGZones[i].is_bullish ? clrAqua : clrMagenta;
+      ObjectSetInteger(0, obj_name, OBJPROP_COLOR, fvg_color);
+      ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+      
+      string tooltip = StringFormat("FVG %s%s",
+                                    FVGZones[i].is_bullish ? "Bullish" : "Bearish",
+                                    FVGZones[i].can_be_target ? " (Target)" : "");
+      ObjectSetString(0, obj_name, OBJPROP_TOOLTIP, tooltip);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Equal Levels                                               |
+//+------------------------------------------------------------------+
+void DrawEqualLevels()
+{
+   for(int i = 0; i < ArraySize(EqualLevels); i++)
+   {
+      if(EqualLevels[i].cleared) continue;
+      
+      string obj_name = StringFormat("Tate_Equal_%d", i);
+      
+      ObjectCreate(0, obj_name, OBJ_HLINE, 0, 0, EqualLevels[i].price);
+      
+      color line_color = EqualLevels[i].is_liquidity_pool ? clrYellow : clrGray;
+      ObjectSetInteger(0, obj_name, OBJPROP_COLOR, line_color);
+      ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetString(0, obj_name, OBJPROP_TOOLTIP,
+                      StringFormat("Equal Level: %.5f (%d touches)",
+                                   EqualLevels[i].price, EqualLevels[i].touch_count));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw ACSD Formations                                            |
+//+------------------------------------------------------------------+
+void DrawACSDFormations()
+{
+   for(int i = 0; i < ArraySize(ACSDFormations); i++)
+   {
+      if(!ACSDFormations[i].in_retest_phase) continue;
+      
+      string obj_name = StringFormat("Tate_ACSD_%d", i);
+      
+      ObjectCreate(0, obj_name, OBJ_HLINE, 0, 0, ACSDFormations[i].break_price);
+      
+      color line_color = (ACSDFormations[i].direction == 1) ? clrLime : clrRed;
+      ObjectSetInteger(0, obj_name, OBJPROP_COLOR, line_color);
+      ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 2);
+      ObjectSetString(0, obj_name, OBJPROP_TOOLTIP,
+                      StringFormat("ACSD %s Break @ %.5f (Conf: %d)",
+                                   (ACSDFormations[i].direction == 1) ? "Bullish" : "Bearish",
+                                   ACSDFormations[i].break_price,
+                                   ACSDFormations[i].confidence));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update Info Panel                                               |
+//+------------------------------------------------------------------+
+void UpdateInfoPanel()
+{
+   // Create panel background
+   if(ObjectFind(0, "Tate_InfoPanel") < 0)
+   {
+      ObjectCreate(0, "Tate_InfoPanel", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_YDISTANCE, 30);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_XSIZE, 250);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_YSIZE, 150);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_BGCOLOR, clrNavy);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, "Tate_InfoPanel", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   }
+   
+   // Create info text
+   if(ObjectFind(0, "Tate_InfoText") < 0)
+   {
+      ObjectCreate(0, "Tate_InfoText", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "Tate_InfoText", OBJPROP_XDISTANCE, 15);
+      ObjectSetInteger(0, "Tate_InfoText", OBJPROP_YDISTANCE, 35);
+      ObjectSetInteger(0, "Tate_InfoText", OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, "Tate_InfoText", OBJPROP_FONTSIZE, 8);
+   }
+   
+   // Calculate statistics
+   double win_rate = (TotalTrades > 0) ? (double)WinningTrades / TotalTrades * 100 : 0;
+   double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   int active_acsd = 0;
+   for(int i = 0; i < ArraySize(ACSDFormations); i++)
+   {
+      if(ACSDFormations[i].in_retest_phase) active_acsd++;
+   }
+   
+   // Update text
+   string info_text = StringFormat(
+      "TATE STRATEGY v3.01\n" +
+      "Bias: %s\n" +
+      "Equity: %.2f\n" +
+      "Win Rate: %.1f%%\n" +
+      "Trades: %d/%d\n" +
+      "Daily P&L: %.2f\n" +
+      "HTF Zones: %d\n" +
+      "LTF Zones: %d\n" +
+      "FVG Zones: %d\n" +
+      "Equal Levels: %d\n" +
+      "Active ACSD: %d\n" +
+      "Session: %s\n" +
+      "Status: %s",
+      CurrentBias,
+      current_equity,
+      win_rate,
+      DailyTradeCount, MaxDailyTrades,
+      DailyPnL,
+      ArraySize(HTFMitigations),
+      ArraySize(LTFMitigations),
+      ArraySize(FVGZones),
+      ArraySize(EqualLevels),
+      active_acsd,
+      IsMarketSessionActive() ? "ACTIVE" : "CLOSED",
+      CheckRiskLimits() ? "RUNNING" : "STOPPED"
+   );
+   
+   ObjectSetString(0, "Tate_InfoText", OBJPROP_TEXT, info_text);
+}
+
+//+------------------------------------------------------------------+
+//| Update Chart Comment                                             |
+//+------------------------------------------------------------------+
+void UpdateChartComment()
+{
+   string session_status = IsMarketSessionActive() ? "ACTIVE" : "INACTIVE";
+   string risk_status = CheckRiskLimits() ? "OK" : "LIMIT";
+   
+   double win_rate = (TotalTrades > 0) ? (double)WinningTrades / TotalTrades * 100 : 0;
+   
+   string comment = StringFormat(
+      "TATE STRATEGY v3.01 - FIXED\n" +
+      "Bias: %s | Session: %s | Risk: %s\n" +
+      "P&L: %.2f | Win Rate: %.1f%% | Trades: %d/%d\n" +
+      "HTF: %d | LTF: %d | FVG: %d | EQ: %d",
+      CurrentBias, session_status, risk_status,
+      DailyPnL, win_rate, DailyTradeCount, MaxDailyTrades,
+      ArraySize(HTFMitigations), ArraySize(LTFMitigations),
+      ArraySize(FVGZones), ArraySize(EqualLevels)
+   );
+   
+   Comment(comment);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Event Handler                                             |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   HistorySelect(TimeCurrent() - 86400, TimeCurrent());
+   
+   int total_deals = HistoryDealsTotal();
+   
+   for(int i = total_deals - 1; i >= 0; i--)
+   {
+      ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket <= 0) continue;
+      
+      if(HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol &&
+         HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == MagicNumber)
+      {
+         double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+         string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+         
+         if(profit != 0)
+         {
+            if(profit > 0)
+            {
+               WinningTrades++;
+               LogInfo(StringFormat("Winning trade: +%.2f $ (%s)", profit, comment));
+            }
+            else
+            {
+               LogInfo(StringFormat("Losing trade: %.2f $ (%s)", profit, comment));
+            }
+            
+            double win_rate = (TotalTrades > 0) ? (double)WinningTrades / TotalTrades * 100 : 0;
+            LogInfo(StringFormat("Stats: Total=%d, Win=%d, Rate=%.1f%%",
+                                TotalTrades, WinningTrades, win_rate));
+            
+            if(EnableAlerts)
+            {
+               Alert(StringFormat("Tate Bot: Trade closed %s%.2f $ (Rate: %.1f%%)",
+                                 profit > 0 ? "+" : "", profit, win_rate));
+            }
+            
+            break;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Log Functions                                                   |
+//+------------------------------------------------------------------+
+void LogInfo(string message)
+{
+   if(EnableLogging)
+   {
+      Print("[INFO] ", TimeToString(TimeCurrent()), " - ", message);
+   }
+}
+
+void LogError(string message)
+{
+   Print("[ERROR] ", TimeToString(TimeCurrent()), " - ", message);
+}
+
+void LogDebug(string message)
+{
+   if(EnableLogging)
+   {
+      Print("[DEBUG] ", TimeToString(TimeCurrent()), " - ", message);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Emergency Stop System                                           |
+//+------------------------------------------------------------------+
+void CheckEmergencyStop()
+{
+   double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double equity_drop = (InitialBalance - current_equity) / InitialBalance * 100;
+   
+   // Check for emergency equity loss
+   if(equity_drop >= 20.0)
+   {
+      LogError("EMERGENCY STOP: 20% equity loss!");
+      
+      CloseAllPositions();
+      
+      if(EnableAlerts)
+         Alert("Tate Bot: EMERGENCY STOP - 20% equity loss!");
+   }
+   
+   // Check for consecutive losses
+   if(TotalTrades - WinningTrades > 15)
+   {
+      LogError("WARNING: Too many losing trades!");
+      
+      if(EnableAlerts)
+         Alert("Tate Bot: Too many losses - check strategy!");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close All Positions                                             |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         
+         MqlTradeRequest request;
+         MqlTradeResult result;
+         ZeroMemory(request);
+         ZeroMemory(result);
+         
+         request.action = TRADE_ACTION_DEAL;
+         request.position = ticket;
+         request.symbol = _Symbol;
+         request.volume = PositionGetDouble(POSITION_VOLUME);
+         request.type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         request.price = (request.type == ORDER_TYPE_SELL) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         request.magic = MagicNumber;
+         request.comment = "Emergency Close";
+         
+         bool order_result = OrderSend(request, result);
+         
+         if(order_result && result.retcode == TRADE_RETCODE_DONE)
+         {
+            LogInfo(StringFormat("Position closed: %d", ticket));
+         }
+         else
+         {
+            LogError(StringFormat("Failed to close position %d: %s", ticket, result.comment));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| END OF TATE STRATEGY EA v3.01 FIXED                            |
+//+------------------------------------------------------------------+
