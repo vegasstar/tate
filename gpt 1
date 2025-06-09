@@ -167,18 +167,23 @@ int OnInit()
    ResetDailyCounters();
    EventSetTimer(60);
 
-   // Check supported filling modes
+   // Check supported filling mode using proper comparison operators
    int filling_mode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-   if(filling_mode == 0)
+   string mode_desc = "";
+
+   if(filling_mode == ORDER_FILLING_FOK)
+      mode_desc = "FOK";
+   else if(filling_mode == ORDER_FILLING_IOC)
+      mode_desc = "IOC";
+   else if(filling_mode == ORDER_FILLING_RETURN)
+      mode_desc = "RETURN";
+   else
    {
       Alert("Symbol does not support any filling mode!");
       return(INIT_FAILED);
    }
 
-   Print("Symbol filling modes: ",
-         ((filling_mode & SYMBOL_FILLING_FOK) ? "FOK " : ""),
-         ((filling_mode & SYMBOL_FILLING_IOC) ? "IOC " : ""),
-         ((filling_mode & SYMBOL_FILLING_RETURN) ? "RETURN " : ""));
+   Print("Symbol filling mode: ", mode_desc);
    
    // Perform initial analysis
    AnalyzeHTFBias();
